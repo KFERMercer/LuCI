@@ -40,6 +40,28 @@ function build_url(...)
 	return table.concat(url, "")
 end
 
+function _ordered_children(node)
+	local name, child, children = nil, nil, {}
+
+	for name, child in pairs(node.nodes) do
+		children[#children+1] = {
+			name  = name,
+			node  = child,
+			order = child.order or 100
+		}
+	end
+
+	table.sort(children, function(a, b)
+		if a.order == b.order then
+			return a.name < b.name
+		else
+			return a.order < b.order
+		end
+	end)
+
+	return children
+end
+
 function node_visible(node)
    if node then
 	  return not (
@@ -55,15 +77,10 @@ end
 function node_childs(node)
 	local rv = { }
 	if node then
-		local k, v
-		for k, v in util.spairs(node.nodes,
-			function(a, b)
-				return (node.nodes[a].order or 100)
-				     < (node.nodes[b].order or 100)
-			end)
-		do
-			if node_visible(v) then
-				rv[#rv+1] = k
+		local _, child
+		for _, child in ipairs(_ordered_children(node)) do
+			if node_visible(child.node) then
+				rv[#rv+1] = child.name
 			end
 		end
 	end
@@ -182,6 +199,7 @@ local function session_retrieve(sid, allowed_users)
 	   (not allowed_users or
 	    util.contains(allowed_users, sdat.values.username))
 	then
+		uci:set_session_id(sid)
 		return sid, sdat.values
 	end
 
@@ -295,10 +313,6 @@ function dispatch(request)
 	ctx.requestpath = ctx.requestpath or freq
 	ctx.path = preq
 
-	if track.i18n then
-		i18n.loadc(track.i18n)
-	end
-
 	-- Init template engine
 	if (c and c.index) or not track.notemplate then
 		local tpl = require("luci.template")
@@ -314,7 +328,7 @@ function dispatch(request)
 			assert(media, "No valid theme found")
 		end
 
-		local function _ifattr(cond, key, val)
+		local function _ifattr(cond, key, val, noescape)
 			if cond then
 				local env = getfenv(3)
 				local scope = (type(env.self) == "table") and env.self
@@ -325,13 +339,16 @@ function dispatch(request)
 						val = util.serialize_json(val)
 					end
 				end
-				return string.format(
-					' %s="%s"', tostring(key),
-					util.pcdata(tostring( val
-					 or (type(env[key]) ~= "function" and env[key])
-					 or (scope and type(scope[key]) ~= "function" and scope[key])
-					 or "" ))
-				)
+
+				val = tostring(val or
+					(type(env[key]) ~= "function" and env[key]) or
+					(scope and type(scope[key]) ~= "function" and scope[key]) or "")
+
+				if noescape ~= true then
+					val = util.pcdata(val)
+				end
+
+				return string.format(' %s="%s"', tostring(key), val)
 			else
 				return ''
 			end
@@ -357,7 +374,7 @@ function dispatch(request)
 			elseif key == "REQUEST_URI" then
 				return build_url(unpack(ctx.requestpath))
 			elseif key == "FULL_REQUEST_URI" then
-				local url = { http.getenv("SCRIPT_NAME"), http.getenv("PATH_INFO") }
+				local url = { http.getenv("SCRIPT_NAME") or "", http.getenv("PATH_INFO") }
 				local query = http.getenv("QUERY_STRING")
 				if query and #query > 0 then
 					url[#url+1] = "?"
@@ -420,6 +437,7 @@ function dispatch(request)
 				context.path = {}
 
 				http.status(403, "Forbidden")
+				http.header("X-LuCI-Login-Required", "yes")
 				tmpl.render(track.sysauth_template or "sysauth", {
 					duser = default_user,
 					fuser = user
@@ -436,6 +454,7 @@ function dispatch(request)
 
 		if not sid or not sdat then
 			http.status(403, "Forbidden")
+			http.header("X-LuCI-Login-Required", "yes")
 			return
 		end
 
@@ -506,10 +525,11 @@ function dispatch(request)
 		else
 			ok, err = util.copcall(target, unpack(args))
 		end
-		assert(ok,
-		       "Failed to execute " .. (type(c.target) == "function" and "function" or c.target.type or "unknown") ..
-		       " dispatcher target for entry '/" .. table.concat(request, "/") .. "'.\n" ..
-		       "The called action terminated with an exception:\n" .. tostring(err or "(unknown)"))
+		if not ok then
+			error500("Failed to execute " .. (type(c.target) == "function" and "function" or c.target.type or "unknown") ..
+			         " dispatcher target for entry '/" .. table.concat(request, "/") .. "'.\n" ..
+			         "The called action terminated with an exception:\n" .. tostring(err or "(unknown)"))
+		end
 	else
 		local root = node()
 		if not root or not root.target then
@@ -595,14 +615,9 @@ function createtree()
 
 	local ctx  = context
 	local tree = {nodes={}, inreq=true}
-	local modi = {}
 
 	ctx.treecache = setmetatable({}, {__mode="v"})
 	ctx.tree = tree
-	ctx.modifiers = modi
-
-	-- Load default translation
-	require "luci.i18n".loadc("base")
 
 	local scope = setmetatable({}, {__index = luci.dispatcher})
 
@@ -612,26 +627,7 @@ function createtree()
 		v()
 	end
 
-	local function modisort(a,b)
-		return modi[a].order < modi[b].order
-	end
-
-	for _, v in util.spairs(modi, modisort) do
-		scope._NAME = v.module
-		setfenv(v.func, scope)
-		v.func()
-	end
-
 	return tree
-end
-
-function modifier(func, order)
-	context.modifiers[#context.modifiers+1] = {
-		func = func,
-		order = order or 0,
-		module
-			= getfenv(2)._NAME
-	}
 end
 
 function assign(path, clone, title, order)
@@ -701,46 +697,87 @@ function _create_node(path)
 		local last = table.remove(path)
 		local parent = _create_node(path)
 
-		c = {nodes={}, auto=true}
-		-- the node is "in request" if the request path matches
-		-- at least up to the length of the node path
-		if parent.inreq and context.path[#path+1] == last then
-		  c.inreq = true
+		c = {nodes={}, auto=true, inreq=true}
+
+		local _, n
+		for _, n in ipairs(path) do
+			if context.path[_] ~= n then
+				c.inreq = false
+				break
+			end
 		end
+
+		c.inreq = c.inreq and (context.path[#path + 1] == last)
+
 		parent.nodes[last] = c
 		context.treecache[name] = c
 	end
+
 	return c
 end
 
 -- Subdispatchers --
 
+function _find_eligible_node(root, prefix, deep, types, descend)
+	local children = _ordered_children(root)
+
+	if not root.leaf and deep ~= nil then
+		local sub_path = { unpack(prefix) }
+
+		if deep == false then
+			deep = nil
+		end
+
+		local _, child
+		for _, child in ipairs(children) do
+			sub_path[#prefix+1] = child.name
+
+			local res_path = _find_eligible_node(child.node, sub_path,
+			                                     deep, types, true)
+
+			if res_path then
+				return res_path
+			end
+		end
+	end
+
+	if descend and
+	   (not types or
+	    (type(root.target) == "table" and
+	     util.contains(types, root.target.type)))
+	then
+		return prefix
+	end
+end
+
+function _find_node(recurse, types)
+	local path = { unpack(context.path) }
+	local name = table.concat(path, ".")
+	local node = context.treecache[name]
+
+	path = _find_eligible_node(node, path, recurse, types)
+
+	if path then
+		dispatch(path)
+	else
+		require "luci.template".render("empty_node_placeholder")
+	end
+end
+
 function _firstchild()
-   local path = { unpack(context.path) }
-   local name = table.concat(path, ".")
-   local node = context.treecache[name]
-
-   local lowest
-   if node and node.nodes and next(node.nodes) then
-	  local k, v
-	  for k, v in pairs(node.nodes) do
-		 if not lowest or
-			(v.order or 100) < (node.nodes[lowest].order or 100)
-		 then
-			lowest = k
-		 end
-	  end
-   end
-
-   assert(lowest ~= nil,
-		  "The requested node contains no childs, unable to redispatch")
-
-   path[#path+1] = lowest
-   dispatch(path)
+	return _find_node(false, nil)
 end
 
 function firstchild()
-   return { type = "firstchild", target = _firstchild }
+	return { type = "firstchild", target = _firstchild }
+end
+
+function _firstnode()
+	return _find_node(true, { "cbi", "form", "template", "arcombine" })
+end
+
+function firstnode()
+	return { type = "firstnode", target = _firstnode }
 end
 
 function alias(...)
@@ -910,7 +947,6 @@ local function _cbi(self, ...)
 	for i, res in ipairs(maps) do
 		res:render({
 			firstmap   = (i == 1),
-			applymap   = applymap,
 			redirect   = redirect,
 			messages   = messages,
 			pageaction = pageaction,
@@ -920,11 +956,12 @@ local function _cbi(self, ...)
 
 	if not config.nofooter then
 		tpl.render("cbi/footer", {
-			flow       = config,
-			pageaction = pageaction,
-			redirect   = redirect,
-			state      = state,
-			autoapply  = config.autoapply
+			flow          = config,
+			pageaction    = pageaction,
+			redirect      = redirect,
+			state         = state,
+			autoapply     = config.autoapply,
+			trigger_apply = applymap
 		})
 	end
 end
