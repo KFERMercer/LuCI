@@ -863,7 +863,7 @@ msgstr "Broadcom BCM%04x 802.11 无线控制器"
 
 #: modules/luci-mod-status/luasrc/view/admin_status/index/20-memory.htm:18
 msgid "Buffered"
-msgstr "已缓冲"
+msgstr "已缓存"
 
 #: protocols/luci-proto-openconnect/luasrc/model/cbi/admin_network/proto_openconnect.lua:75
 msgid "CA certificate; if empty it will be saved after the first connection."
